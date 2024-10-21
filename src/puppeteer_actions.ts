@@ -1,14 +1,15 @@
 import path from "path";
 import puppeteer, { Browser, ElementHandle, Frame, Page } from "puppeteer";
 import dotenv from "dotenv";
-import { delay } from "./utils";
+import { delay, round } from "./utils";
 import { getBalance } from "./fetch";
+import { OrderState } from "./types";
 
 dotenv.config();
 
 export const openBrowser = async (): Promise<Browser> => {
   return await puppeteer.launch({
-    headless: true,
+    headless: false,
     args: [`--user-data-dir=${path.resolve("./user_data")}`],
   });
 };
@@ -82,6 +83,8 @@ export const openTokenByName = async (
     return;
   }
 
+  await delay(10000);
+
   const result = await frame.evaluate((tokenName) => {
     const listElement = document.querySelector("ul._list_1ni5n_1");
 
@@ -151,7 +154,7 @@ export const openTokenByName = async (
   }
 };
 
-let myOrder: number = 0;
+let myOrder: number = OrderState.myOrder;
 let myOrderAmount: number = 0;
 
 export const work = async (
@@ -177,33 +180,49 @@ export const work = async (
   console.log("Max buy order:", orders[0].buyOrder);
   console.log(orders);
 
-  if (orders[0].buyOrder < maxOrderAmount) {
-    if (
-      orders[0].buyOrder >= myOrder &&
-      myOrderAmount !== orders[0].amountOfOrder
-    ) {
-      await cancelAllOrders(page, frame);
-      const balance = await getBalance("USDT");
-      delay(1000);
-      console.log("Поставлю :", orders[0].buyOrder + 0.0001, balance);
-      await setBuyPriceAndUsdtAmount(
-        frame,
-        orders[0].buyOrder + 0.0001,
-        balance
-      );
-      myOrder = orders[0].buyOrder + 0.0001;
-      myOrderAmount = balance;
-      await confirmOrder(page);
-    }
-  } else {
-    if (myOrder !== orders[0].buyOrder) {
-      await cancelAllOrders(page, frame);
-      const balance = await getBalance("USDT");
-      delay(1000);
-      await setBuyPriceAndUsdtAmount(frame, defaultOrderAmount, balance);
-      myOrder = defaultOrderAmount;
-      await confirmOrder(page);
-    }
+  if (orders[0].buyOrder < maxOrderAmount && orders[0].buyOrder > myOrder) {
+    await cancelAllOrders(page, frame);
+    const balance = await getBalance("USDT");
+    delay(1000);
+    console.log("Поставлю :", round(orders[0].buyOrder + 0.0001), balance);
+    await setBuyPriceAndUsdtAmount(
+      frame,
+      round(orders[0].buyOrder + 0.0001),
+      balance
+    );
+    myOrder = round(orders[0].buyOrder + 0.0001) + 0.0001;
+    myOrderAmount = balance;
+    await confirmOrder(page);
+    return;
+  }
+
+  if (
+    orders[0].buyOrder < maxOrderAmount &&
+    myOrder - orders[1].buyOrder > 0.0001
+  ) {
+    await cancelAllOrders(page, frame);
+    const balance = await getBalance("USDT");
+    delay(1000);
+    console.log("Поставлю :", round(orders[1].buyOrder + 0.0001), balance);
+    await setBuyPriceAndUsdtAmount(
+      frame,
+      round(orders[1].buyOrder + 0.0001),
+      balance
+    );
+    myOrder = round(orders[1].buyOrder + 0.0001);
+    myOrderAmount = balance;
+    await confirmOrder(page);
+  }
+
+  if (orders[0].buyOrder > maxOrderAmount) {
+    await cancelAllOrders(page, frame);
+    const balance = await getBalance("USDT");
+    delay(1000);
+    console.log("Поставлю :", defaultOrderAmount, balance);
+    await setBuyPriceAndUsdtAmount(frame, defaultOrderAmount, balance);
+    myOrder = defaultOrderAmount;
+    myOrderAmount = balance;
+    await confirmOrder(page);
   }
 };
 
@@ -271,7 +290,7 @@ const checkBuyOrders = async (
 
       orders.push({
         amountOfOrder: isNaN(amountOfOrder) ? 0 : amountOfOrder,
-        buyOrder: isNaN(buyOrder) ? 0 : buyOrder,
+        buyOrder: isNaN(buyOrder) ? 0 : round(buyOrder),
       });
     }
   } catch (error) {
@@ -308,22 +327,20 @@ const setBuyPriceAndUsdtAmount = async (
 
     console.log(`Successfully set buy price to ${buyPrice}`);
 
-    const usdtAmountInputElement = await frame.waitForSelector(
-      usdtAmountInputSelector,
-      {
-        visible: true,
-      }
-    );
+    const usdtAmountInputElements = await frame.$$(usdtAmountInputSelector);
 
-    if (!usdtAmountInputElement) {
-      console.error("USDT amount input element not found.");
+    if (usdtAmountInputElements.length < 2) {
+      console.error("The second USDT amount input element not found.");
       return;
     }
 
-    await usdtAmountInputElement.click({ clickCount: 3 });
-    await usdtAmountInputElement.press("Backspace");
-    await usdtAmountInputElement.type(usdtAmount.toString());
-    await usdtAmountInputElement.press("Enter");
+    const secondUsdtAmountInputElement = usdtAmountInputElements[1];
+
+    await secondUsdtAmountInputElement.click({ clickCount: 3 });
+    await secondUsdtAmountInputElement.press("Backspace");
+    await secondUsdtAmountInputElement.type(usdtAmount.toString());
+    await delay(1000);
+    await secondUsdtAmountInputElement.press("Enter");
 
     console.log(`Successfully set USDT amount to ${usdtAmount}`);
   } catch (error) {
@@ -337,6 +354,7 @@ const confirmOrder = async (page: Page): Promise<void> => {
 
   await page.waitForSelector(footerSelector, {
     visible: true,
+    timeout: 5000,
   });
 
   try {
@@ -373,7 +391,7 @@ const confirmOrder = async (page: Page): Promise<void> => {
   }
 };
 
-const cancelAllOrders = async (page: Page, frame: Frame): Promise<void> => {
+const cancelAllOrders = async (page: Page, frame: Frame): Promise<boolean> => {
   const spanText = "Отменить все";
 
   try {
@@ -399,15 +417,15 @@ const cancelAllOrders = async (page: Page, frame: Frame): Promise<void> => {
       return { success: true, message: "Cancelled all orders successfully" };
     }, spanText);
 
-    if (cancelResult.success) {
-      console.log(cancelResult.message);
-    } else {
+    if (!cancelResult.success) {
       console.error(cancelResult.message);
-      return;
+      return false;
     }
+
+    console.log(cancelResult.message);
   } catch (error) {
     console.error("Error cancelling all orders:", error);
-    return;
+    return false;
   }
 
   const footerSelector = ".web-app-footer.is-visible";
@@ -442,12 +460,41 @@ const cancelAllOrders = async (page: Page, frame: Frame): Promise<void> => {
       buttonSelector
     );
 
-    if (confirmResult.success) {
-      console.log(confirmResult.message);
-    } else {
+    if (!confirmResult.success) {
       console.error(confirmResult.message);
+      return false;
     }
+
+    console.log(confirmResult.message);
+    return true;
   } catch (error) {
     console.error("Error confirming cancel order:", error);
+    return false;
   }
+};
+
+export const reloadFrame = async (page: Page): Promise<void> => {
+  await page.waitForSelector("iframe");
+
+  const frameHandle = await page.$("iframe");
+  const frame = await frameHandle?.contentFrame();
+
+  if (!frame) {
+    console.error("Frame not found");
+    return;
+  }
+
+  try {
+    const frameUrl = frame.url();
+    console.log("Reloading frame with URL:", frameUrl);
+
+    await frame.goto(frameUrl, { waitUntil: "load" });
+
+    await frame.waitForFunction(() => document.readyState === "complete");
+
+    console.log("Frame reloaded and DOM fully loaded");
+  } catch (error) {
+    console.error("Error reloading frame:", error);
+  }
+  await delay(30000);
 };

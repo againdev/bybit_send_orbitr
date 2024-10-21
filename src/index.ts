@@ -1,16 +1,50 @@
+import { Browser } from "puppeteer";
 import {
   openBrowser,
   openPage,
   openSendMiniApp,
   openTokenByName,
+  reloadFrame,
   work,
 } from "./puppeteer_actions";
+import { OrderState } from "./types";
 
-(async function () {
-  const browser = await openBrowser();
-  const page = await openPage(browser);
+async function main(browser: Browser | null = null) {
+  try {
+    if (!browser) {
+      browser = await openBrowser();
+    }
 
-  await openSendMiniApp(page);
-  await openTokenByName(page, "USD Coin");
-  setInterval(async () => await work(page), 15000);
-})();
+    const page = await openPage(browser);
+    await openSendMiniApp(page);
+    await openTokenByName(page, "USD Coin");
+
+    const circle = async () => {
+      await work(page);
+      await reloadFrame(page);
+      await circle();
+    };
+
+    try {
+      await circle();
+    } catch (error) {
+      console.error("Error in circle function:", error);
+      await browser.close();
+      await main();
+    }
+  } catch (error) {
+    console.error("Error in main function:", error);
+
+    OrderState.myOrder = 0;
+
+    if (browser) {
+      await browser.close();
+    }
+
+    setTimeout(async () => {
+      await main();
+    }, 2000);
+  }
+}
+
+main();
