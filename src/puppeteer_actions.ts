@@ -8,7 +8,7 @@ dotenv.config();
 
 export const openBrowser = async (): Promise<Browser> => {
   return await puppeteer.launch({
-    headless: false,
+    headless: true,
     args: [`--user-data-dir=${path.resolve("./user_data")}`],
   });
 };
@@ -129,12 +129,13 @@ export const openTokenByName = async (
       return;
     }
 
+    await delay(1000);
+
     const linkElementHandle = await frame.evaluateHandle(() => {
       const links = Array.from(document.querySelectorAll("a"));
       return links.find((link) => link.textContent?.includes("Биржа")) || null;
     });
 
-    await delay(3000);
     if (linkElementHandle) {
       const elementHandle =
         linkElementHandle.asElement() as ElementHandle<Element>;
@@ -151,6 +152,7 @@ export const openTokenByName = async (
 };
 
 let myOrder: number = 0;
+let myOrderAmount: number = 0;
 
 export const work = async (
   page: Page,
@@ -170,23 +172,34 @@ export const work = async (
 
   console.log("Iframe loaded successfully.");
 
-  const maxBuyOrder = await checkMaxBuyOrder(frame);
-  console.log("Max buy order:", maxBuyOrder);
-  const balance = await getBalance("USDT");
-  console.log("Balance: ", balance);
+  const orders = await checkBuyOrders(frame);
+  console.log("Amount of Max buy order", orders[0].amountOfOrder);
+  console.log("Max buy order:", orders[0].buyOrder);
+  console.log(orders);
 
-  if (maxBuyOrder < maxOrderAmount) {
-    if (maxBuyOrder > myOrder) {
+  if (orders[0].buyOrder < maxOrderAmount) {
+    if (
+      orders[0].buyOrder >= myOrder &&
+      myOrderAmount !== orders[0].amountOfOrder
+    ) {
       await cancelAllOrders(page, frame);
-      await delay(1000);
-      await setBuyPriceAndUsdtAmount(frame, maxBuyOrder + 0.0001, balance);
-      myOrder = maxBuyOrder + 0.0001;
+      const balance = await getBalance("USDT");
+      delay(1000);
+      console.log("Поставлю :", orders[0].buyOrder + 0.0001, balance);
+      await setBuyPriceAndUsdtAmount(
+        frame,
+        orders[0].buyOrder + 0.0001,
+        balance
+      );
+      myOrder = orders[0].buyOrder + 0.0001;
+      myOrderAmount = balance;
       await confirmOrder(page);
     }
   } else {
-    if (myOrder !== maxBuyOrder) {
+    if (myOrder !== orders[0].buyOrder) {
       await cancelAllOrders(page, frame);
-      await delay(1000);
+      const balance = await getBalance("USDT");
+      delay(1000);
       await setBuyPriceAndUsdtAmount(frame, defaultOrderAmount, balance);
       myOrder = defaultOrderAmount;
       await confirmOrder(page);
@@ -194,46 +207,78 @@ export const work = async (
   }
 };
 
-const checkMaxBuyOrder = async (frame: Frame): Promise<number> => {
-  console.log("Waiting for elements with data-key='0'...");
+const checkBuyOrders = async (
+  frame: Frame
+): Promise<{ amountOfOrder: number; buyOrder: number }[]> => {
+  const orders = [];
+
   try {
-    await frame.waitForSelector('[data-key="0"]', { timeout: 5000 });
-    console.log("Elements found.");
+    for (let i = 0; i <= 5; i++) {
+      const selector = `[data-key="${i}"]`;
+
+      try {
+        await frame.waitForSelector(selector, { timeout: 5000 });
+      } catch (error) {
+        continue;
+      }
+
+      const result = await frame.evaluate((key) => {
+        const elements = Array.from(
+          document.querySelectorAll(`[data-key="${key}"]`)
+        );
+        if (elements.length < 2) {
+          return {
+            success: false,
+            message: `Less than two elements found for data-key="${key}".`,
+          };
+        }
+
+        const secondElement = elements[1];
+
+        const getPriceFromElement = (
+          element: Element,
+          spanIndex: number
+        ): string | null => {
+          const spans = element.querySelectorAll("span");
+          return spans[spanIndex]
+            ? spans[spanIndex].textContent?.trim() || null
+            : null;
+        };
+
+        const buyOrderPriceText = getPriceFromElement(secondElement, 0);
+        const amountOfOrderPriceText = getPriceFromElement(secondElement, 1);
+
+        if (!buyOrderPriceText || !amountOfOrderPriceText) {
+          return {
+            success: false,
+            message: `Price text not found in one or both spans for data-key="${key}".`,
+          };
+        }
+
+        return {
+          success: true,
+          buyOrderPriceText,
+          amountOfOrderPriceText,
+        };
+      }, i);
+
+      if (!result.success) {
+        continue;
+      }
+
+      const amountOfOrder = parseFloat(result.amountOfOrderPriceText ?? "0");
+      const buyOrder = parseFloat(result.buyOrderPriceText ?? "0");
+
+      orders.push({
+        amountOfOrder: isNaN(amountOfOrder) ? 0 : amountOfOrder,
+        buyOrder: isNaN(buyOrder) ? 0 : buyOrder,
+      });
+    }
   } catch (error) {
-    console.log(
-      "Elements with data-key='0' not found within the timeout.",
-      error
-    );
-    return 0;
+    console.log("An error occurred while checking buy orders.", error);
   }
 
-  const result = await frame.evaluate(() => {
-    const elements = Array.from(document.querySelectorAll('[data-key="0"]'));
-    console.log("Elements found:", elements);
-
-    if (elements.length < 2) {
-      return { success: false, message: "Less than two elements found." };
-    }
-
-    const secondElement = elements[1];
-
-    const span = secondElement.querySelector("span");
-    if (!span) {
-      return { success: false, message: "Span not found." };
-    }
-
-    console.log("Span found:", span);
-    const priceText = span.textContent?.trim() || "";
-    return { success: true, priceText };
-  });
-
-  if (!result.success) {
-    console.log(result.message);
-    return 0;
-  }
-
-  const price = parseFloat(result.priceText ?? "0");
-  return isNaN(price) ? 0 : price;
+  return orders;
 };
 
 const setBuyPriceAndUsdtAmount = async (
